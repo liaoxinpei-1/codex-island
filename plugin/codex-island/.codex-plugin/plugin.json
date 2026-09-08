@@ -1,0 +1,18 @@
+{
+  "name": "codex-island",
+  "version": "0.1.0",
+  "description": "在 MacBook 灵动岛中查看 Codex 任务、打开对话与设置。",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Island",
+    "shortDescription": "MacBook 原生灵动岛与宠物任务入口",
+    "longDescription": "打开本机 Codex Island，查看实时任务状态、使用现有宠物、调起对话与设置，并检查本地连接。",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "打开灵动岛并检查与当前 Codex 的连接。"
+  }
+}

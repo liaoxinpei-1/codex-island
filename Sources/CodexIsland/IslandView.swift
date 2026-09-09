@@ -84,7 +84,7 @@ struct IslandView: View {
     }
     private var statusColor: Color {
         if !model.connected { return .gray }
-        if !model.expanded && !model.priorityTasks.isEmpty { return .yellow }
+        if model.hasPendingCoverage || (!model.expanded && !model.priorityTasks.isEmpty) { return .yellow }
         return model.attentionCount > 0 ? .orange : Color(red: 0.6, green: 0.9, blue: 0.74)
     }
 
@@ -123,14 +123,14 @@ struct IslandView: View {
                     }.font(.system(size: 11))
                 }
             }
-            if !model.priorityTasks.isEmpty {
+            if !model.priorityTasks.isEmpty || model.hasPendingCoverage {
                 Text(model.prioritySummary).font(.system(size: 11)).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if model.priorityTasks.isEmpty && !model.presentedRecentTasks {
+            if model.priorityTasks.isEmpty && model.pendingTasks.isEmpty && !model.presentedRecentTasks {
                 VStack(spacing: 10) {
                     Image(systemName: model.catalogAvailable ? "bubble.left" : "link").font(.system(size: 23)).foregroundStyle(.secondary)
-                    Text(!model.connected ? "连接恢复后显示实时动态" : !model.catalogAvailable ? "先打开 Codex，即可查看任务" : model.tasks.isEmpty ? "从一句话开始" : "暂时没有进行中或待查看的内容").font(.system(size: 13))
+                    Text(model.hasPendingCoverage ? "部分来源的活动状态尚未确认" : !model.connected ? "连接恢复后显示实时动态" : !model.catalogAvailable ? "先打开 Codex，即可查看任务" : model.tasks.isEmpty ? "从一句话开始" : "暂时没有进行中或待查看的内容").font(.system(size: 13))
                     Text(model.connection).font(.system(size: 11)).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -139,6 +139,14 @@ struct IslandView: View {
                         ForEach(model.priorityTasks) { task in
                             Button { model.openTask(task) } label: { taskRow(task) }.buttonStyle(TaskButtonStyle())
                                 .accessibilityLabel("\(task.title)，\(task.source.label)，\(task.displayStatus)，打开对话")
+                        }
+                        if !model.pendingTasks.isEmpty {
+                            Text("状态待同步 · 未计入重点数量").font(.system(size: 11)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 4)
+                            ForEach(model.pendingTasks) { task in
+                                Button { model.openTask(task) } label: { taskRow(task) }.buttonStyle(TaskButtonStyle())
+                                    .accessibilityLabel("\(task.title)，\(task.source.label)，\(task.displayStatus)，未计入重点数量，打开对话")
+                            }
                         }
                         if model.presentedRecentTasks {
                             Text("最近任务").font(.system(size: 11, weight: .medium))

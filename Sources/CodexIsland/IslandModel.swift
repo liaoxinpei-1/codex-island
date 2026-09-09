@@ -52,6 +52,7 @@ import IslandCore
     var onStatusChange: (() -> Void)?
     private var observer: IPCObserver?
     private var lastBridge = BridgeUpdate()
+    var sourceCoverage: [String: SourceCoverage] { lastBridge.coverage }
     private var onlineReader: OnlineCatalogReader?
     private var onlineTimer: Timer?
     private var accountID: String?
@@ -112,7 +113,7 @@ import IslandCore
         switch result {
         case .success(let update):
             if accountID != update.accountID {
-                hosts = [:]; cloudTasks = []; cachedChats = []; hasHostCatalog = false
+                hosts = [:]; cloudTasks = []; cachedChats = []; hasHostCatalog = true
                 hostFetchAt = .distantPast; cloudFetchAt = .distantPast
             }
             accountID = update.accountID; onlineMessage = nil
@@ -126,7 +127,7 @@ import IslandCore
         case .failure(let error):
             onlineMessage = error.message; cloudAvailable = false; hostsAvailable = false
             if case .authentication = error {
-                accountID = nil; cloudTasks = []; cachedChats = []; hosts = [:]; hasHostCatalog = false
+                accountID = nil; cloudTasks = []; cachedChats = []; hosts = [:]; hasHostCatalog = true
             }
         }
         rebuildTasks()
@@ -220,12 +221,20 @@ import IslandCore
     var attentionCount: Int { tasks.filter { [.waiting, .failed].contains($0.phase) }.count }
     var newContentCount: Int { tasks.filter { $0.hasUnreadContent || $0.phase == .completed }.count }
     var priorityTasks: [IslandTask] { tasks.filter { $0.section != .recent } }
-    var recentTasks: [IslandTask] { tasks.filter { $0.section == .recent } }
+    var pendingTasks: [IslandTask] { tasks.filter(\.hasPendingActivity) }
+    var hasPendingCoverage: Bool {
+        !pendingTasks.isEmpty || (accountID != nil && !hostsAvailable && lastBridge.tasks.contains {
+            $0.hasPendingActivity && $0.source.hostID?.hasPrefix("remote-control:") == true
+        })
+    }
+    var recentTasks: [IslandTask] { tasks.filter { $0.section == .recent && !$0.hasPendingActivity } }
     var prioritySummary: String {
         var parts: [String] = []
         if attentionCount > 0 { parts.append("\(attentionCount) 待处理") }
         if runningCount > 0 { parts.append("\(runningCount) 进行中") }
         if newContentCount > 0 { parts.append("\(newContentCount) 有新内容") }
+        if !pendingTasks.isEmpty { parts.append("\(pendingTasks.count) 状态待同步") }
+        else if hasPendingCoverage { parts.append("远端来源待同步") }
         return parts.isEmpty ? "当前没有待处理的更新" : parts.joined(separator: " · ")
     }
     var petPhase: TaskPhase {
@@ -236,12 +245,13 @@ import IslandCore
     var compactStatus: String {
         let total = priorityTasks.count
         if total > 0 { return "×\(total)" }
+        if hasPendingCoverage { return "待同步" }
         return connected ? "就绪" : "离线"
     }
     var bodyHeight: CGFloat {
         if page == .settings { return 370 }
         if page == .chat { return 300 }
-        let count = min(showRecentTasks ? tasks.count : priorityTasks.count, 4)
+        let count = min(showRecentTasks ? tasks.count : priorityTasks.count + pendingTasks.count, 4)
         return count == 0 ? 220 : CGFloat(count) * 60 + 150
     }
     func toggleRecentTasks() {

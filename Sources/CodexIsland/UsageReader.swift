@@ -81,7 +81,7 @@ final class UsageReader: @unchecked Sendable {
             data.append(10)
             try input.fileHandleForWriting.write(contentsOf: data)
         }
-        try send(["id": 1, "method": "initialize", "params": ["clientInfo": ["name": "codex-island", "version": "0.1.23"]]])
+        try send(["id": 1, "method": "initialize", "params": ["clientInfo": ["name": "codex-island", "version": "0.1.24"]]])
         let deadline = ProcessInfo.processInfo.systemUptime + 12
         var buffer = Data()
         var bytes = [UInt8](repeating: 0, count: 65536)

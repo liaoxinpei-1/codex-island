@@ -9,7 +9,7 @@ private final class OnlineDiagnosticResult: @unchecked Sendable {
 }
 
 if CommandLine.arguments.contains("--version") {
-    print("Codex Island 0.1.23")
+    print("Codex Island 0.1.24")
 } else if CommandLine.arguments.contains("--diagnose") || CommandLine.arguments.contains("--diagnose-sources") {
     // Read-only check; does not show windows, create tasks, or modify the Codex client.
     let home = ProcessInfo.processInfo.environment["CODEX_HOME"].map { URL(fileURLWithPath: $0) }
@@ -34,8 +34,10 @@ if CommandLine.arguments.contains("--version") {
     lock.lock(); let update = latest; lock.unlock()
     let library = PetLibrary(home: home)
     var info: [String: Any] = [
-        "version": "0.1.23", "connected": update.connected, "liveTaskCount": update.liveCount,
+        "version": "0.1.24", "connected": update.connected, "liveTaskCount": update.liveCount,
         "catalogCount": update.tasks.count, "catalogAvailable": update.catalogAvailable,
+        "pendingTaskCount": update.tasks.filter(\.hasPendingActivity).count,
+        "sourceCoverage": update.coverage.mapValues(\.diagnostic),
         "message": update.message, "petCount": library.pets.count,
         "defaultPetLoads": library.pets.first.map { library.image(for: $0.id) != nil } ?? false,
         "screenCount": NSScreen.screens.count,

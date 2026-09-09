@@ -54,6 +54,7 @@ public enum CatalogMetadata {
             var task = IslandTask(id: id, title: title(item["title"]?.string), cwd: display?["environment_label"]?.string ?? "",
                                   updatedAt: timestamp(item["updated_at"]?.double ?? item["created_at"]?.double ?? 0),
                                   hasUnreadContent: unread, source: .codexCloud)
+            task.evidence = .cloudQuery
             switch display?["latest_turn_status_display"]?["turn_status"]?.string {
             case "pending": task.phase = .running; task.statusNote = "云端排队中"
             case "in_progress": task.phase = .running
@@ -83,9 +84,12 @@ public struct DesktopTaskCatalog {
             let name = envelope.connections.first { $0.hostId == hostID }?.displayName
             remoteTasks += summaries.filter { $0.hostId == hostID && UUID(uuidString: $0.conversationId) != nil }
                 .sorted { $0.updatedAt > $1.updatedAt }.prefix(max(0, limitPerHost)).map {
-                    IslandTask(id: $0.conversationId, title: CatalogMetadata.title($0.title), cwd: $0.cwd ?? "",
+                    var task = IslandTask(id: $0.conversationId, title: CatalogMetadata.title($0.title), cwd: $0.cwd ?? "",
                                updatedAt: CatalogMetadata.timestamp($0.updatedAt),
                                source: .remote(hostID: hostID, name: name), statusNote: "状态未同步")
+                    task.activityHint = $0.threadRuntimeStatus?.type == "active" ? .active : $0.hasUnreadTurn == true ? .unread : nil
+                    if task.activityHint != nil { task.evidence = .cachedHint; task.statusNote = "状态待同步 · 仅有缓存线索" }
+                    return task
                 }
         }
         chatAccounts = envelope.atoms.chatAccounts
@@ -108,7 +112,10 @@ public struct DesktopTaskCatalog {
         var title: String?
         var cwd: String?
         var updatedAt: Double
+        var threadRuntimeStatus: RuntimeStatus?
+        var hasUnreadTurn: Bool?
     }
+    private struct RuntimeStatus: Decodable { var type: String }
     private struct Connection: Decodable { var hostId: String; var displayName: String? }
     private struct ChatRow: Decodable { var id: String; var title: String?; var createdAt: String?; var updatedAt: String?; var isTask: Bool }
     private struct ChatPage: Decodable { var items: [ChatRow] }

@@ -5,6 +5,29 @@ import IslandCore
 @testable import CodexIsland
 
 final class ConnectedPresentationTests: XCTestCase {
+    @MainActor func testActiveCacheWithoutSnapshotsDoesNotReportGlobalReady() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let rows: [[String: Any]] = [
+            ["conversationId": UUID().uuidString, "hostId": "ssh:build", "title": "Long task", "updatedAt": 1,
+             "threadRuntimeStatus": ["type": "active"], "hasUnreadTurn": false],
+            ["conversationId": UUID().uuidString, "hostId": "ssh:build", "title": "Recent task", "updatedAt": Date().timeIntervalSince1970,
+             "threadRuntimeStatus": ["type": "active"], "hasUnreadTurn": true],
+            ["conversationId": UUID().uuidString, "hostId": "ssh:build", "title": "History", "updatedAt": 1,
+             "threadRuntimeStatus": ["type": "notLoaded"], "hasUnreadTurn": false]
+        ]
+        try JSONSerialization.data(withJSONObject: ["electron-persisted-atom-state": ["remote-thread-summaries-v3:ssh:build": rows]])
+            .write(to: home.appendingPathComponent(".codex-global-state.json"))
+        let tasks = try DesktopTaskCatalog(codexHome: home).remoteTasks
+        let model = IslandModel(home: home)
+        model.apply(BridgeUpdate(tasks: tasks, connected: true, liveCount: 0))
+        XCTAssertTrue(tasks.allSatisfy { $0.phase == .unknown && !$0.hasUnreadContent })
+        XCTAssertEqual(model.priorityTasks.count, 0)
+        XCTAssertEqual(model.pendingTasks.count, 2, "Old and recent activity hints are both unconfirmed; age is not proof of liveness")
+        XCTAssertEqual(model.recentTasks.count, 1, "Ordinary notLoaded history must stay quiet")
+        XCTAssertEqual(model.compactStatus, "待同步", "A connected IPC socket does not confirm that remote tasks are idle")
+    }
     @MainActor func testSourceFailuresAndExpiryWithdrawRunningStateWithoutMixingHosts() {
         let model = IslandModel(home: FileManager.default.temporaryDirectory)
         let now = Date()
@@ -42,6 +65,25 @@ final class ConnectedPresentationTests: XCTestCase {
         XCTAssertTrue(model.tasks.isEmpty)
     }
 
+    @MainActor func testOfflineHostAndAccountSwitchNeverPromoteCachedHints() {
+        let model = IslandModel(home: FileManager.default.temporaryDirectory)
+        var cached = IslandTask(id: UUID().uuidString, title: "Remote", cwd: "", updatedAt: 1,
+                                source: .remote(hostID: "remote-control:env", name: nil))
+        cached.activityHint = .active; cached.evidence = .cachedHint
+        model.apply(BridgeUpdate(tasks: [cached], connected: true))
+        model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "a", hosts: [RemoteHost(id: "remote-control:env", name: "Windows", online: false)], cloudTasks: [])))
+        XCTAssertEqual(model.compactStatus, "待同步")
+        XCTAssertEqual(model.priorityTasks.count, 0)
+        XCTAssertEqual(model.pendingTasks.first?.displayStatus, "主机离线 · 状态不可用")
+        model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "b", hosts: nil, cloudTasks: [])))
+        XCTAssertTrue(model.tasks.isEmpty, "Do not expose a previous account's remote records while the new host scope is unverified")
+        XCTAssertEqual(model.compactStatus, "待同步")
+        model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "b", hosts: [], cloudTasks: [])))
+        XCTAssertEqual(model.compactStatus, "就绪")
+        model.applyOnlineCatalog(.failure(.authentication))
+        XCTAssertTrue(model.tasks.isEmpty)
+    }
+
     @MainActor func testRenderMixedSourcesAndLongMachineName() throws {
         let model = IslandModel(home: FileManager.default.temporaryDirectory)
         model.showUsage = false
@@ -70,6 +112,18 @@ final class ConnectedPresentationTests: XCTestCase {
             let url = URL(fileURLWithPath: folder)
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url.appendingPathComponent("task-sources.png"))
+            var pending = IslandTask(id: "pending", title: "远端任务有活动线索", cwd: "D:\\code\\project", updatedAt: 1,
+                                     source: .remote(hostID: "remote-control:env", name: "Windows"), statusNote: "状态待同步 · 未确认当前活动")
+            pending.activityHint = .active; pending.evidence = .cachedHint
+            model.tasks = [pending]; model.showRecentTasks = false; model.presentedRecentTasks = false
+            model.presentationBodyHeight = model.bodyHeight
+            let pendingHost = NSHostingView(rootView: IslandView(model: model, hover: { _ in }))
+            pendingHost.sizingOptions = []
+            pendingHost.frame = NSRect(x: 0, y: 0, width: 460, height: model.layout.headerHeight + model.bodyHeight)
+            pendingHost.layoutSubtreeIfNeeded()
+            let pendingBitmap = try XCTUnwrap(pendingHost.bitmapImageRepForCachingDisplay(in: pendingHost.bounds))
+            pendingHost.cacheDisplay(in: pendingHost.bounds, to: pendingBitmap)
+            try XCTUnwrap(pendingBitmap.representation(using: .png, properties: [:])).write(to: url.appendingPathComponent("pending-state.png"))
         }
     }
 }

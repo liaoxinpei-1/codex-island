@@ -2,12 +2,29 @@ import Foundation
 import Darwin
 import IslandCore
 
+struct SourceCoverage: Equatable {
+    var catalog = 0
+    var snapshots = 0
+    var pending = 0
+    var retries = 0
+    var expirations = 0
+    var firstSnapshotDelayMax: Double?
+    var reasons: [String: Int] = [:]
+    var diagnostic: [String: Any] {
+        var value: [String: Any] = ["catalog": catalog, "currentSnapshots": snapshots, "pending": pending,
+                                  "retries": retries, "expirations": expirations, "reasons": reasons]
+        if let firstSnapshotDelayMax { value["firstSnapshotDelayMaxSeconds"] = firstSnapshotDelayMax }
+        return value
+    }
+}
+
 struct BridgeUpdate {
     var tasks: [IslandTask] = []
     var connected = false
     var liveCount = 0
     var message = "正在连接 Codex…"
     var catalogAvailable = true
+    var coverage: [String: SourceCoverage] = [:]
 }
 
 /// Version-gated, read-only adapter for the desktop client's local IPC transport.
@@ -17,6 +34,7 @@ final class IPCObserver {
     private let home: URL
     private let heartbeatInterval: TimeInterval
     private let snapshotTimeout: TimeInterval
+    private let recoveryDelays: [TimeInterval]
     private let callback: (BridgeUpdate) -> Void
     private let lock = NSLock()
     private var stopped = false
@@ -33,12 +51,25 @@ final class IPCObserver {
     private var lastResnapshot: [String: Date] = [:]
     private var snapshotDeadlines: [String: Date] = [:]
     private var archivedIDs = Set<String>()
+    private struct Recovery {
+        var requestedAt = Date()
+        var firstSnapshotDelay: Double?
+        var nextRetry: Date?
+        var retries = 0
+        var expirations = 0
+        var reason: String?
+        var activityHint: TaskActivityHint?
+        var gapRequested = false
+    }
+    private var recovery: [String: Recovery] = [:]
     private var connectionMessage = "正在连接 Codex…"
 
     init(home: URL, heartbeatInterval: TimeInterval = 30, snapshotTimeout: TimeInterval = 10,
+         recoveryDelays: [TimeInterval] = [2, 5, 10],
          callback: @escaping (BridgeUpdate) -> Void) {
         self.home = home; self.callback = callback
         self.heartbeatInterval = heartbeatInterval; self.snapshotTimeout = snapshotTimeout
+        self.recoveryDelays = recoveryDelays
     }
     func start() {
         guard thread == nil else { return }
@@ -53,18 +84,21 @@ final class IPCObserver {
     private func run() {
         while !shouldStop {
             autoreleasepool {
+                var failureReason = "connection_lost"
                 do {
                     fd = try connectSocket()
                     try send(["type": "request", "requestId": UUID().uuidString, "method": "initialize",
                               "version": 0, "params": ["clientType": "codex-island"]])
                     try readLoop()
                 } catch ObserverError.incompatible {
+                    failureReason = "protocol_incompatible"
                     connectionMessage = "此 Codex 版本尚未兼容 · 可继续打开对话"
                 } catch {
                     connectionMessage = "等待 Codex 客户端 · 正在重连"
                 }
                 if fd >= 0 { Darwin.close(fd); fd = -1 }
-                live.removeAll(); owners.removeAll(); snapshotDeadlines.removeAll(); subscribed.removeAll(); clientID = ""
+                for id in Array(live.keys) { invalidateLive(id, reason: failureReason) }
+                owners.removeAll(); snapshotDeadlines.removeAll(); subscribed.removeAll(); clientID = ""
                 refreshCatalog(); publish()
             }
             for _ in 0..<6 { if shouldStop { break }; Thread.sleep(forTimeInterval: 0.5) }
@@ -128,7 +162,7 @@ final class IPCObserver {
                 if Date().timeIntervalSince(lastCatalog) > 8 { refreshCatalog(); try updateSubscriptions() }
                 // Periodically revalidate ownership/status so an idle former owner cannot remain "running" forever.
                 if Date().timeIntervalSince(lastHeartbeat) > heartbeatInterval {
-                    for id in subscribed.keys {
+                    for id in live.keys where live[id]?.phase != .unknown || live[id]?.hasUnreadContent == true {
                         snapshotDeadlines[id] = Date().addingTimeInterval(snapshotTimeout)
                         try follow(id, following: true)
                     }
@@ -136,7 +170,16 @@ final class IPCObserver {
                 }
                 // Keep priority rows stable while refresh replies are in flight; expire missing owners.
                 for id in snapshotDeadlines.keys.filter({ snapshotDeadlines[$0]! < Date() }) {
-                    snapshotDeadlines.removeValue(forKey: id); live.removeValue(forKey: id); owners.removeValue(forKey: id)
+                    invalidateLive(id, reason: "snapshot_timeout")
+                    recovery[id]?.expirations += 1
+                }
+                let due = recovery.keys.filter { (live[$0] == nil || live[$0]?.phase == .unknown) && recovery[$0]?.nextRetry.map { $0 <= Date() } == true }.sorted().prefix(4)
+                for id in due {
+                    try follow(id, following: true)
+                    recovery[id]!.retries += 1
+                    let count = recovery[id]!.retries
+                    recovery[id]!.nextRetry = count < recoveryDelays.count ? Date().addingTimeInterval(recoveryDelays[count]) : nil
+                    if count >= recoveryDelays.count { recovery[id]!.reason = "retry_limit_reached" }
                 }
             }
             if Date().timeIntervalSince(lastPublish) > 0.5 { publish() }
@@ -160,7 +203,7 @@ final class IPCObserver {
             let params = message["params"]
             if message["method"]?.string == "client-status-changed", params?["status"]?.string == "disconnected",
                let owner = params?["clientId"]?.string {
-                for id in owners.keys.filter({ owners[$0] == owner }) { live.removeValue(forKey: id); owners.removeValue(forKey: id) }
+                for id in owners.keys.filter({ owners[$0] == owner }) { invalidateLive(id, reason: "owner_disconnected") }
                 return
             }
             guard let hostID = params?["hostId"]?.string, let threadID = params?["conversationId"]?.string else { return }
@@ -184,18 +227,55 @@ final class IPCObserver {
             if let snapshot = LiveTaskState(change: change) {
                 snapshotDeadlines.removeValue(forKey: id)
                 live[id] = snapshot; owners[id] = message["sourceClientId"]?.string
+                if recovery[id]?.firstSnapshotDelay == nil, let requestedAt = recovery[id]?.requestedAt {
+                    recovery[id]?.firstSnapshotDelay = Date().timeIntervalSince(requestedAt)
+                }
+                recovery[id]?.nextRetry = nil; recovery[id]?.reason = nil
+                if snapshot.phase == .unknown && !snapshot.hasUnreadContent {
+                    if recovery[id]?.activityHint != nil { recovery[id]?.reason = "state_unavailable" }
+                    if let record = recovery[id], record.activityHint != nil, record.retries < recoveryDelays.count {
+                        recovery[id]?.nextRetry = Date().addingTimeInterval(recoveryDelays[record.retries])
+                    }
+                } else { recovery[id]?.activityHint = nil }
+                recovery[id]?.gapRequested = false
             } else if change["type"]?.string == "patches" {
+                guard owners[id] == nil || owners[id] == message["sourceClientId"]?.string else { return }
                 if var state = live[id], state.apply(change: change) {
                     // A continuous update also confirms this stream is alive during a heartbeat refresh.
                     snapshotDeadlines.removeValue(forKey: id)
                     live[id] = state
+                    if state.phase != .unknown || state.hasUnreadContent {
+                        recovery[id]?.nextRetry = nil; recovery[id]?.activityHint = nil; recovery[id]?.reason = nil
+                    }
                 }
-                else if Date().timeIntervalSince(lastResnapshot[id] ?? .distantPast) > 2 {
-                    live.removeValue(forKey: id); lastResnapshot[id] = Date(); try follow(id, following: true)
+                else {
+                    let needsSnapshot = recovery[id]?.gapRequested != true
+                    invalidateLive(id, reason: "revision_gap")
+                    recovery[id]?.gapRequested = true
+                    if needsSnapshot && Date().timeIntervalSince(lastResnapshot[id] ?? .distantPast) > 2 {
+                        lastResnapshot[id] = Date(); try follow(id, following: true)
+                    }
                 }
             }
         default: break
         }
+    }
+
+    private func invalidateLive(_ id: String, reason: String) {
+        let previous = live.removeValue(forKey: id)
+        owners.removeValue(forKey: id); snapshotDeadlines.removeValue(forKey: id)
+        if let previous, let index = catalog.firstIndex(where: { $0.id == id }) {
+            if [.running, .waiting, .failed].contains(previous.phase) { catalog[index].activityHint = .active }
+            else if previous.hasUnreadContent || previous.phase == .completed { catalog[index].activityHint = .unread }
+            recovery[id]?.activityHint = catalog[index].activityHint
+            // A new loss after confirmed state starts one bounded recovery episode.
+            recovery[id]?.retries = 0
+            if catalog[index].activityHint != nil { recovery[id]?.nextRetry = recoveryDelays.first.map { Date().addingTimeInterval($0) } }
+        }
+        if previous == nil && reason == "revision_gap" && recovery[id]?.gapRequested != true && recovery[id]?.retries == 0 {
+            recovery[id]?.nextRetry = recoveryDelays.first.map { Date().addingTimeInterval($0) }
+        }
+        recovery[id]?.reason = reason
     }
 
     private func refreshCatalog() {
@@ -219,10 +299,23 @@ final class IPCObserver {
         let desired = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         for id in Set(subscribed.keys).subtracting(desired.keys) {
             try follow(id, following: false); live.removeValue(forKey: id); owners.removeValue(forKey: id); snapshotDeadlines.removeValue(forKey: id)
+            recovery.removeValue(forKey: id); lastResnapshot.removeValue(forKey: id)
         }
         let added = Set(desired.keys).subtracting(subscribed.keys)
+        recovery = recovery.filter { desired[$0.key] != nil }
         subscribed = desired
-        for id in added { try follow(id, following: true) }
+        for id in added {
+            let hint = recovery[id]?.activityHint ?? desired[id]?.activityHint
+            recovery[id] = Recovery(nextRetry: hint == nil ? nil : recoveryDelays.first.map { Date().addingTimeInterval($0) }, activityHint: hint)
+            try follow(id, following: true)
+        }
+        // A newly appearing hint can trigger recovery; an unchanged cache cannot restart an exhausted loop.
+        for id in desired.keys where !added.contains(id) && (live[id] == nil || (live[id]?.phase == .unknown && live[id]?.hasUnreadContent != true)) && recovery[id]?.retries == 0 && recovery[id]?.nextRetry == nil {
+            if desired[id]?.activityHint != nil {
+                recovery[id]?.activityHint = desired[id]?.activityHint
+                recovery[id]?.nextRetry = recoveryDelays.first.map { Date().addingTimeInterval($0) }
+            }
+        }
     }
     private func follow(_ id: String, following: Bool) throws {
         guard !clientID.isEmpty, let task = subscribed[id], let hostID = task.source.hostID else { return }
@@ -247,17 +340,39 @@ final class IPCObserver {
         var tasks: [IslandTask] = catalog.map { task -> IslandTask in
             var task = task
             if let state = live[task.id] {
+                task.evidence = .ipc
+                task.activityHint = state.phase == .unknown && !state.hasUnreadContent ? (recovery[task.id]?.activityHint ?? task.activityHint) : nil
                 task.statusNote = nil
                 task.phase = state.phase
                 task.hasUnreadContent = state.hasUnreadContent
                 if let activityAt = state.activityAt { task.updatedAt = max(task.updatedAt, activityAt) }
                 if let title = state.title, !title.isEmpty { task.title = title }
-            } else { task.invalidateStatus(task.source == .local ? "最近任务" : "状态未同步") }
+                if task.hasPendingActivity { task.statusNote = "状态待同步 · 宿主尚未提供有效状态" }
+            } else {
+                task.activityHint = recovery[task.id]?.activityHint ?? task.activityHint
+                let evidence = task.evidence
+                task.invalidateStatus(task.activityHint == nil ? (task.source == .local ? "最近任务" : "状态未同步") : "状态待同步 · 未确认当前活动")
+                task.evidence = recovery[task.id]?.firstSnapshotDelay == nil ? evidence : .expired
+            }
             return task
         }
         tasks.sort(by: IslandTask.precedes)
+        var coverage: [String: SourceCoverage] = [:]
+        for task in tasks {
+            guard let host = task.source.hostID else { continue }
+            var source = coverage[host] ?? SourceCoverage()
+            source.catalog += 1
+            if task.evidence == .ipc { source.snapshots += 1 }
+            if task.hasPendingActivity { source.pending += 1 }
+            if let record = recovery[task.id] {
+                source.retries += record.retries; source.expirations += record.expirations
+                if let delay = record.firstSnapshotDelay { source.firstSnapshotDelayMax = max(source.firstSnapshotDelayMax ?? 0, delay) }
+                if let reason = record.reason { source.reasons[reason, default: 0] += 1 }
+            }
+            coverage[host] = source
+        }
         callback(BridgeUpdate(tasks: tasks, connected: !clientID.isEmpty, liveCount: live.count,
-                              message: connectionMessage, catalogAvailable: catalogAvailable))
+                              message: connectionMessage, catalogAvailable: catalogAvailable, coverage: coverage))
     }
     private enum ObserverError: Error { case unavailable, incompatible }
 }

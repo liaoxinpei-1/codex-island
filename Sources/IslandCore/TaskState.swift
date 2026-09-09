@@ -55,6 +55,14 @@ public enum TaskSource: Equatable, Sendable {
     }
 }
 
+public enum TaskEvidence: String, Sendable {
+    case unknown, cachedHint, ipc, cloudQuery, expired
+}
+
+public enum TaskActivityHint: String, Sendable {
+    case active, unread
+}
+
 public struct IslandTask: Identifiable, Equatable, Sendable {
     public let threadID: String
     public var source: TaskSource
@@ -75,6 +83,9 @@ public struct IslandTask: Identifiable, Equatable, Sendable {
     public var phase: TaskPhase
     public var hasUnreadContent: Bool
     public var statusNote: String?
+    public var activityHint: TaskActivityHint?
+    public var evidence: TaskEvidence = .unknown
+    public var hasPendingActivity: Bool { phase == .unknown && activityHint != nil }
     public init(id: String, title: String, cwd: String, updatedAt: Double, phase: TaskPhase = .unknown, hasUnreadContent: Bool = false,
                 source: TaskSource = .local, statusNote: String? = nil) {
         self.threadID = id; self.source = source; self.title = title; self.cwd = cwd; self.updatedAt = updatedAt; self.phase = phase
@@ -94,6 +105,9 @@ public struct IslandTask: Identifiable, Equatable, Sendable {
         statusNote ?? (hasUnreadContent && [.unknown, .idle].contains(phase) ? "有新内容 · 待查看" : phase.label)
     }
     public mutating func invalidateStatus(_ note: String) {
+        if [.running, .waiting, .failed].contains(phase) { activityHint = .active }
+        else if hasUnreadContent || phase == .completed { activityHint = .unread }
+        evidence = .expired
         phase = .unknown; hasUnreadContent = false; statusNote = note
     }
     public static func precedes(_ left: IslandTask, _ right: IslandTask) -> Bool {

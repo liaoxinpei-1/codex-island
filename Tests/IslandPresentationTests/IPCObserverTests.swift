@@ -13,15 +13,20 @@ final class IPCObserverTests: XCTestCase {
         try exerciseObserver()
     }
 
+    func testMissingHintedSnapshotRetriesAreBoundedAndLateSnapshotRestoresCoverage() throws {
+        try exerciseObserver(heartbeatInterval: 2, snapshotTimeout: 1, checkRecovery: true)
+    }
+
     private func exerciseObserver(heartbeatInterval: TimeInterval = 30, snapshotTimeout: TimeInterval = 10,
-                                  checkHeartbeat: Bool = false) throws {
+                                  checkHeartbeat: Bool = false, checkRecovery: Bool = false) throws {
         // Two machines deliberately have the same thread UUID.
         let home = URL(fileURLWithPath: "/tmp/island-ipc-" + String(UUID().uuidString.prefix(8)))
         let ipc = home.appendingPathComponent("ipc")
         try FileManager.default.createDirectory(at: ipc, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: home) }
         let id = UUID().uuidString
-        let rows: (String) -> [[String: Any]] = { [["conversationId": id, "hostId": $0, "title": "Test", "updatedAt": 1]] }
+        let rows: (String) -> [[String: Any]] = { [["conversationId": id, "hostId": $0, "title": "Test", "updatedAt": 1,
+            "threadRuntimeStatus": ["type": checkRecovery && $0 == "ssh:one" ? "active" : "notLoaded"]]] }
         try JSONSerialization.data(withJSONObject: ["electron-persisted-atom-state": [
             "remote-thread-summaries-v3:ssh:one": rows("ssh:one"), "remote-thread-summaries-v3:ssh:two": rows("ssh:two")
         ]]).write(to: home.appendingPathComponent(".codex-global-state.json"))
@@ -41,7 +46,8 @@ final class IPCObserverTests: XCTestCase {
         XCTAssertEqual(bound, 0); XCTAssertEqual(chmod(path, 0o600), 0); XCTAssertEqual(listen(server, 1), 0)
         let lock = NSLock()
         var latest = BridgeUpdate()
-        let observer = IPCObserver(home: home, heartbeatInterval: heartbeatInterval, snapshotTimeout: snapshotTimeout) { update in lock.lock(); latest = update; lock.unlock() }
+        let observer = IPCObserver(home: home, heartbeatInterval: heartbeatInterval, snapshotTimeout: snapshotTimeout,
+                                   recoveryDelays: checkRecovery ? [0.1, 0.2, 0.3] : [2, 5, 10]) { update in lock.lock(); latest = update; lock.unlock() }
         observer.start()
         defer { observer.stop() }
         var descriptor = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
@@ -88,6 +94,36 @@ final class IPCObserverTests: XCTestCase {
             }
             return false
         }
+        if checkRecovery {
+            try snapshot(host: "ssh:two", status: "active")
+            for attempt in 0..<3 {
+                let retry = try receive()
+                XCTAssertEqual(retry["params"]?["hostId"]?.string, "ssh:one")
+                if attempt == 0 { try snapshot(host: "ssh:one", status: "notLoaded") }
+            }
+            XCTAssertTrue(eventually { $0.coverage["ssh:one"]?.pending == 1 && $0.coverage["ssh:one"]?.retries == 3 && $0.tasks.filter { $0.phase == .running }.count == 1 })
+            // Across subsequent health checks, only the responsive host is refreshed.
+            for _ in 0..<2 {
+                let refresh = try receive()
+                XCTAssertEqual(refresh["params"]?["hostId"]?.string, "ssh:two")
+                try snapshot(host: "ssh:two", status: "active")
+            }
+            try snapshot(host: "ssh:one", status: "active")
+            XCTAssertTrue(eventually { $0.liveCount == 2 && $0.tasks.allSatisfy { !$0.hasPendingActivity && $0.evidence == .ipc } })
+            lock.lock(); let recovered = latest; lock.unlock()
+            XCTAssertEqual(recovered.coverage["ssh:one"]?.retries, 3)
+            XCTAssertGreaterThan(recovered.coverage["ssh:one"]?.firstSnapshotDelayMax ?? 0, 0)
+            try send(["type": "broadcast", "method": "thread-stream-state-changed", "version": 11, "sourceClientId": "ssh:one",
+                      "params": ["hostId": "ssh:one", "conversationId": id, "change": ["type": "patches", "baseRevision": 1, "revision": 2,
+                      "patches": [["op": "replace", "path": ["threadRuntimeStatus", "type"], "value": "idle"],
+                                  ["op": "replace", "path": ["hasUnreadTurn"], "value": true]]]]])
+            XCTAssertTrue(eventually { $0.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .completed && $0.tasks.filter { $0.section != .recent }.count == 2 })
+            try send(["type": "broadcast", "method": "thread-stream-state-changed", "version": 11, "sourceClientId": "ssh:one",
+                      "params": ["hostId": "ssh:one", "conversationId": id, "change": ["type": "patches", "baseRevision": 2, "revision": 3,
+                      "patches": [["op": "replace", "path": ["hasUnreadTurn"], "value": false]]]]])
+            XCTAssertTrue(eventually { $0.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .idle && $0.tasks.filter { $0.section != .recent }.count == 1 && $0.tasks.allSatisfy { !$0.hasPendingActivity } })
+            return
+        }
         try snapshot(host: "ssh:one", status: "active")
         try snapshot(host: "ssh:two", status: "idle")
         XCTAssertTrue(eventually { value in
@@ -111,7 +147,8 @@ final class IPCObserverTests: XCTestCase {
             XCTAssertEqual(refreshed.tasks.filter { $0.section != .recent }.count, 1)
 
             // A later completely silent heartbeat must still expire the previously healthy task.
-            _ = try [receive(), receive()]
+            let healthyRefresh = try receive()
+            XCTAssertEqual(healthyRefresh["params"]?["hostId"]?.string, "ssh:one", "Unresponsive history must not restart on every global heartbeat")
             XCTAssertTrue(eventually { $0.liveCount == 0 && $0.tasks.allSatisfy { $0.phase == .unknown } })
             return
         }

@@ -120,13 +120,16 @@ final class IslandPanel: NSPanel {
             let transition = PanelFrameTransition(from: panel.frame, to: target)
             let started = ProcessInfo.processInfo.systemUptime
             let timer = Timer(timeInterval: 1.0 / Double(min(120, screen.maximumFramesPerSecond)), repeats: true) { [weak self] timer in
-                guard let self else { timer.invalidate(); return }
-                let progress = (ProcessInfo.processInfo.systemUptime - started) / 0.22
-                self.applyFrame(transition.frame(at: progress))
-                if progress >= 1 {
-                    timer.invalidate()
-                    self.frameTimer = nil
-                    self.finishTransition()
+                // This timer runs only on RunLoop.main; keep each frame update synchronous.
+                MainActor.assumeIsolated {
+                    guard let self else { timer.invalidate(); return }
+                    let progress = (ProcessInfo.processInfo.systemUptime - started) / 0.22
+                    self.applyFrame(transition.frame(at: progress))
+                    if progress >= 1 {
+                        timer.invalidate()
+                        self.frameTimer = nil
+                        self.finishTransition()
+                    }
                 }
             }
             frameTimer = timer

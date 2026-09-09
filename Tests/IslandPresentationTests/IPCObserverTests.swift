@@ -5,7 +5,16 @@ import IslandCore
 @testable import CodexIsland
 
 final class IPCObserverTests: XCTestCase {
+    func testValidHeartbeatPatchKeepsStateUntilANonresponsiveRefresh() throws {
+        try exerciseObserver(heartbeatInterval: 2, snapshotTimeout: 0.2, checkHeartbeat: true)
+    }
+
     func testSubscriptionsAndRevisionsAreIsolatedByHostAndUnsupportedVersionClearsState() throws {
+        try exerciseObserver()
+    }
+
+    private func exerciseObserver(heartbeatInterval: TimeInterval = 30, snapshotTimeout: TimeInterval = 10,
+                                  checkHeartbeat: Bool = false) throws {
         // Two machines deliberately have the same thread UUID.
         let home = URL(fileURLWithPath: "/tmp/island-ipc-" + String(UUID().uuidString.prefix(8)))
         let ipc = home.appendingPathComponent("ipc")
@@ -32,7 +41,7 @@ final class IPCObserverTests: XCTestCase {
         XCTAssertEqual(bound, 0); XCTAssertEqual(chmod(path, 0o600), 0); XCTAssertEqual(listen(server, 1), 0)
         let lock = NSLock()
         var latest = BridgeUpdate()
-        let observer = IPCObserver(home: home) { update in lock.lock(); latest = update; lock.unlock() }
+        let observer = IPCObserver(home: home, heartbeatInterval: heartbeatInterval, snapshotTimeout: snapshotTimeout) { update in lock.lock(); latest = update; lock.unlock() }
         observer.start()
         defer { observer.stop() }
         var descriptor = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
@@ -85,6 +94,35 @@ final class IPCObserverTests: XCTestCase {
             value.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .running &&
             value.tasks.first { $0.source.hostID == "ssh:two" }?.phase == .idle
         })
+        if checkHeartbeat {
+            let refresh = try [receive(), receive()]
+            XCTAssertEqual(Set(refresh.compactMap { $0["params"]?["hostId"]?.string }), ["ssh:one", "ssh:two"])
+            // Only one host responds, with a continuous patch instead of a full snapshot.
+            try send(["type": "broadcast", "method": "thread-stream-state-changed", "version": 11, "sourceClientId": "ssh:one",
+                      "params": ["hostId": "ssh:one", "conversationId": id, "change": ["type": "patches", "baseRevision": 1,
+                      "revision": 2, "patches": [["op": "add", "path": ["updatedAt"], "value": 1234]]]]])
+            // Wait for the other host to expire, proving the old deadline and a publish cycle have elapsed.
+            XCTAssertTrue(eventually { $0.tasks.first { $0.source.hostID == "ssh:two" }?.phase == .unknown })
+            lock.lock(); let refreshed = latest; lock.unlock()
+            XCTAssertEqual(refreshed.liveCount, 1)
+            let active = try XCTUnwrap(refreshed.tasks.first { $0.source.hostID == "ssh:one" })
+            XCTAssertEqual(active.phase, .running)
+            XCTAssertEqual(active.updatedAt, 1234)
+            XCTAssertEqual(refreshed.tasks.filter { $0.section != .recent }.count, 1)
+
+            // A later completely silent heartbeat must still expire the previously healthy task.
+            _ = try [receive(), receive()]
+            XCTAssertTrue(eventually { $0.liveCount == 0 && $0.tasks.allSatisfy { $0.phase == .unknown } })
+            return
+        }
+        try send(["type": "broadcast", "method": "client-status-changed",
+                  "params": ["clientId": "ssh:two", "status": "disconnected"]])
+        XCTAssertTrue(eventually { $0.liveCount == 1 &&
+            $0.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .running &&
+            $0.tasks.first { $0.source.hostID == "ssh:two" }?.phase == .unknown
+        })
+        try snapshot(host: "ssh:two", status: "idle")
+        XCTAssertTrue(eventually { $0.liveCount == 2 })
         try send(["type": "broadcast", "method": "thread-archived", "version": 2,
                   "params": ["hostId": "ssh:two", "conversationId": id]])
         let unsubscribe = try receive()

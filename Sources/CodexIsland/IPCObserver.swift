@@ -15,6 +15,8 @@ struct BridgeUpdate {
 final class IPCObserver {
     static let supportedSnapshotVersion = 11
     private let home: URL
+    private let heartbeatInterval: TimeInterval
+    private let snapshotTimeout: TimeInterval
     private let callback: (BridgeUpdate) -> Void
     private let lock = NSLock()
     private var stopped = false
@@ -33,8 +35,10 @@ final class IPCObserver {
     private var archivedIDs = Set<String>()
     private var connectionMessage = "正在连接 Codex…"
 
-    init(home: URL, callback: @escaping (BridgeUpdate) -> Void) {
+    init(home: URL, heartbeatInterval: TimeInterval = 30, snapshotTimeout: TimeInterval = 10,
+         callback: @escaping (BridgeUpdate) -> Void) {
         self.home = home; self.callback = callback
+        self.heartbeatInterval = heartbeatInterval; self.snapshotTimeout = snapshotTimeout
     }
     func start() {
         guard thread == nil else { return }
@@ -123,9 +127,9 @@ final class IPCObserver {
             if !clientID.isEmpty {
                 if Date().timeIntervalSince(lastCatalog) > 8 { refreshCatalog(); try updateSubscriptions() }
                 // Periodically revalidate ownership/status so an idle former owner cannot remain "running" forever.
-                if Date().timeIntervalSince(lastHeartbeat) > 30 {
+                if Date().timeIntervalSince(lastHeartbeat) > heartbeatInterval {
                     for id in subscribed.keys {
-                        snapshotDeadlines[id] = Date().addingTimeInterval(2)
+                        snapshotDeadlines[id] = Date().addingTimeInterval(snapshotTimeout)
                         try follow(id, following: true)
                     }
                     lastHeartbeat = Date()
@@ -181,7 +185,11 @@ final class IPCObserver {
                 snapshotDeadlines.removeValue(forKey: id)
                 live[id] = snapshot; owners[id] = message["sourceClientId"]?.string
             } else if change["type"]?.string == "patches" {
-                if var state = live[id], state.apply(change: change) { live[id] = state }
+                if var state = live[id], state.apply(change: change) {
+                    // A continuous update also confirms this stream is alive during a heartbeat refresh.
+                    snapshotDeadlines.removeValue(forKey: id)
+                    live[id] = state
+                }
                 else if Date().timeIntervalSince(lastResnapshot[id] ?? .distantPast) > 2 {
                     live.removeValue(forKey: id); lastResnapshot[id] = Date(); try follow(id, following: true)
                 }

@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 
 /// A single interpolation drives both window placement and content layout.
-public struct PanelFrameTransition {
+public struct PanelFrameTransition: Sendable {
     public let from: CGRect
     public let to: CGRect
     public init(from: CGRect, to: CGRect) { self.from = from; self.to = to }

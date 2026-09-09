@@ -24,12 +24,13 @@ final class IPCObserver {
     private var catalog: [IslandTask] = []
     private var live: [String: LiveTaskState] = [:]
     private var owners: [String: String] = [:]
-    private var subscribed = Set<String>()
+    private var subscribed: [String: IslandTask] = [:]
     private var catalogAvailable = false
     private var lastCatalog = Date.distantPast
     private var lastPublish = Date.distantPast
     private var lastResnapshot: [String: Date] = [:]
     private var snapshotDeadlines: [String: Date] = [:]
+    private var archivedIDs = Set<String>()
     private var connectionMessage = "正在连接 Codex…"
 
     init(home: URL, callback: @escaping (BridgeUpdate) -> Void) {
@@ -123,7 +124,7 @@ final class IPCObserver {
                 if Date().timeIntervalSince(lastCatalog) > 8 { refreshCatalog(); try updateSubscriptions() }
                 // Periodically revalidate ownership/status so an idle former owner cannot remain "running" forever.
                 if Date().timeIntervalSince(lastHeartbeat) > 30 {
-                    for id in subscribed {
+                    for id in subscribed.keys {
                         snapshotDeadlines[id] = Date().addingTimeInterval(2)
                         try follow(id, following: true)
                     }
@@ -136,7 +137,7 @@ final class IPCObserver {
             }
             if Date().timeIntervalSince(lastPublish) > 0.5 { publish() }
         }
-        for id in subscribed { try? follow(id, following: false) }
+        for id in subscribed.keys { try? follow(id, following: false) }
     }
 
     private func receive(_ message: JSONValue) throws {
@@ -158,8 +159,18 @@ final class IPCObserver {
                 for id in owners.keys.filter({ owners[$0] == owner }) { live.removeValue(forKey: id); owners.removeValue(forKey: id) }
                 return
             }
-            guard params?["hostId"]?.string == "local", let id = params?["conversationId"]?.string,
-                  subscribed.contains(id) else { return }
+            guard let hostID = params?["hostId"]?.string, let threadID = params?["conversationId"]?.string else { return }
+            let id = IslandTask.ipcIdentity(threadID: threadID, hostID: hostID)
+            if message["method"]?.string == "thread-unarchived", message["version"]?.int == 1 {
+                archivedIDs.remove(id); lastCatalog = .distantPast; return
+            }
+            guard subscribed[id] != nil else { return }
+            if message["method"]?.string == "thread-archived", message["version"]?.int == 2 {
+                archivedIDs.insert(id)
+                live.removeValue(forKey: id); owners.removeValue(forKey: id)
+                catalog.removeAll { $0.id == id }
+                try updateSubscriptions(); publish(); return
+            }
             if ["thread-stream-following-status-requested", "thread-read-state-changed"].contains(message["method"]?.string ?? "") {
                 try follow(id, following: true); return
             }
@@ -181,8 +192,11 @@ final class IPCObserver {
 
     private func refreshCatalog() {
         lastCatalog = Date()
-        do {
-            let recent = try TaskCatalog(codexHome: home).read()
+        let local = try? TaskCatalog(codexHome: home).read()
+        let remote = try? DesktopTaskCatalog(codexHome: home).remoteTasks
+        if local != nil || remote != nil {
+            let recent = ((local ?? catalog.filter { $0.source == .local }) + (remote ?? catalog.filter { $0.source.hostID != "local" }))
+                .filter { !archivedIDs.contains($0.id) }
             // Keep active, waiting, and unread work visible outside the recent catalog page.
             let ids = Set(recent.map(\.id))
             let retained = catalog.filter {
@@ -190,23 +204,23 @@ final class IPCObserver {
                 return state.hasUnreadContent || [.running, .waiting, .failed, .completed].contains(state.phase)
             }
             catalog = recent + retained.prefix(12); catalogAvailable = true
-        } catch { catalogAvailable = false }
+        } else { catalogAvailable = false }
     }
 
     private func updateSubscriptions() throws {
-        let desired = Set(catalog.map(\.id))
-        for id in subscribed.subtracting(desired) {
+        let desired = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for id in Set(subscribed.keys).subtracting(desired.keys) {
             try follow(id, following: false); live.removeValue(forKey: id); owners.removeValue(forKey: id); snapshotDeadlines.removeValue(forKey: id)
         }
-        let added = desired.subtracting(subscribed)
+        let added = Set(desired.keys).subtracting(subscribed.keys)
         subscribed = desired
         for id in added { try follow(id, following: true) }
     }
     private func follow(_ id: String, following: Bool) throws {
-        guard !clientID.isEmpty else { return }
+        guard !clientID.isEmpty, let task = subscribed[id], let hostID = task.source.hostID else { return }
         try send(["type": "broadcast", "method": "thread-stream-following-changed", "version": 1,
                   "sourceClientId": clientID,
-                  "params": ["conversationId": id, "hostId": "local", "following": following]])
+                  "params": ["conversationId": task.threadID, "hostId": hostID, "following": following]])
     }
     private func send(_ object: [String: Any]) throws {
         let data = IPCFrameDecoder.encode(try JSONSerialization.data(withJSONObject: object))
@@ -225,11 +239,12 @@ final class IPCObserver {
         var tasks: [IslandTask] = catalog.map { task -> IslandTask in
             var task = task
             if let state = live[task.id] {
+                task.statusNote = nil
                 task.phase = state.phase
                 task.hasUnreadContent = state.hasUnreadContent
                 if let activityAt = state.activityAt { task.updatedAt = max(task.updatedAt, activityAt) }
                 if let title = state.title, !title.isEmpty { task.title = title }
-            } else { task.phase = .unknown }
+            } else { task.invalidateStatus(task.source == .local ? "最近任务" : "状态未同步") }
             return task
         }
         tasks.sort(by: IslandTask.precedes)

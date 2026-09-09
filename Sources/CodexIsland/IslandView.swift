@@ -130,7 +130,7 @@ struct IslandView: View {
             if model.priorityTasks.isEmpty && !model.presentedRecentTasks {
                 VStack(spacing: 10) {
                     Image(systemName: model.catalogAvailable ? "bubble.left" : "link").font(.system(size: 23)).foregroundStyle(.secondary)
-                    Text(!model.connected ? "连接恢复后显示实时动态" : !model.catalogAvailable ? "先打开 Codex，即可查看本机任务" : model.tasks.isEmpty ? "从一句话开始" : "暂时没有进行中或待查看的内容").font(.system(size: 13))
+                    Text(!model.connected ? "连接恢复后显示实时动态" : !model.catalogAvailable ? "先打开 Codex，即可查看任务" : model.tasks.isEmpty ? "从一句话开始" : "暂时没有进行中或待查看的内容").font(.system(size: 13))
                     Text(model.connection).font(.system(size: 11)).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -138,7 +138,7 @@ struct IslandView: View {
                     LazyVStack(spacing: 6) {
                         ForEach(model.priorityTasks) { task in
                             Button { model.openTask(task) } label: { taskRow(task) }.buttonStyle(TaskButtonStyle())
-                                .accessibilityLabel("\(task.title)，\(task.displayStatus)，打开对话")
+                                .accessibilityLabel("\(task.title)，\(task.source.label)，\(task.displayStatus)，打开对话")
                         }
                         if model.presentedRecentTasks {
                             Text("最近任务").font(.system(size: 11, weight: .medium))
@@ -146,7 +146,7 @@ struct IslandView: View {
                                 .padding(.top, 4).padding(.bottom, 2)
                             ForEach(model.recentTasks) { task in
                                 Button { model.openTask(task) } label: { taskRow(task) }.buttonStyle(TaskButtonStyle())
-                                    .accessibilityLabel("\(task.title)，\(task.displayStatus)，打开对话")
+                                    .accessibilityLabel("\(task.title)，\(task.source.label)，\(task.displayStatus)，打开对话")
                             }
                         }
                     }
@@ -181,12 +181,19 @@ struct IslandView: View {
                         Text("新").font(.system(size: 10, weight: .medium)).foregroundStyle(.mint)
                             .padding(.horizontal, 5).padding(.vertical, 1).background(.mint.opacity(0.12), in: Capsule())
                     }
+                    Spacer(minLength: 0)
+                    Label(task.source.label, systemImage: task.source.symbol)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: 130, alignment: .trailing).layoutPriority(1)
                 }
-                Text("\(task.displayStatus) · \(task.projectName)").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Text([task.displayStatus, task.projectName].filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 2)
             Image(systemName: "arrow.up.right").font(.system(size: 10)).foregroundStyle(.secondary)
         }.padding(11).frame(maxWidth: .infinity, alignment: .leading)
+            .help([task.title, task.source.label, task.displayStatus, task.cwd].filter { !$0.isEmpty }.joined(separator: "\n"))
     }
 
     private var chat: some View {
@@ -242,9 +249,13 @@ struct IslandView: View {
                     }
                     Divider()
                     HStack {
-                        Text(model.connected ? "已连接 · \(model.liveCount) 个任务状态" : model.connection)
+                        Text(model.liveCount > 0 ? "客户端实时状态 · \(model.liveCount) 个任务" : model.connection)
                         Spacer()
                     }.font(.system(size: 11)).foregroundStyle(.secondary)
+                    ForEach(model.sourceMessages, id: \.self) { message in
+                        Text(message).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     if model.shortcutAvailable { Text("⌃⌥I 随时展开或收起").font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
                 }.font(.system(size: 12)).toggleStyle(IslandToggleStyle()).controlSize(.small)
             }.scrollIndicators(.hidden)

@@ -1,6 +1,6 @@
 import Foundation
 
-public enum TaskPhase: String, Codable {
+public enum TaskPhase: String, Codable, Sendable {
     case running, waiting, completed, idle, failed, unknown
     public var label: String {
         switch self {
@@ -24,18 +24,64 @@ public enum TaskPhase: String, Codable {
     }
 }
 
-public struct IslandTask: Identifiable, Equatable {
-    public let id: String
+public enum TaskSource: Equatable, Sendable {
+    case local
+    case remote(hostID: String, name: String?)
+    case codexCloud
+    case chatGPT(isWork: Bool)
+
+    public var hostID: String? {
+        switch self {
+        case .local: return "local"
+        case .remote(let hostID, _): return hostID
+        default: return nil
+        }
+    }
+    public var label: String {
+        switch self {
+        case .local: return "本机"
+        case .remote(let hostID, let name):
+            return name ?? "远程 · \(hostID.suffix(8))"
+        case .codexCloud: return "Codex 云端"
+        case .chatGPT(let isWork): return isWork ? "ChatGPT Work 云端" : "ChatGPT 云端"
+        }
+    }
+    public var symbol: String {
+        switch self {
+        case .local: return "laptopcomputer"
+        case .remote: return "desktopcomputer"
+        case .codexCloud, .chatGPT: return "cloud"
+        }
+    }
+}
+
+public struct IslandTask: Identifiable, Equatable, Sendable {
+    public let threadID: String
+    public var source: TaskSource
+    public var id: String {
+        switch source {
+        case .local: return threadID
+        case .remote(let hostID, _): return Self.ipcIdentity(threadID: threadID, hostID: hostID)
+        case .codexCloud: return "cloud/\(threadID)"
+        case .chatGPT: return "chatgpt/\(threadID)"
+        }
+    }
+    public static func ipcIdentity(threadID: String, hostID: String) -> String {
+        hostID == "local" ? threadID : "\(hostID)/\(threadID)"
+    }
     public var title: String
     public var cwd: String
     public var updatedAt: Double
     public var phase: TaskPhase
     public var hasUnreadContent: Bool
-    public init(id: String, title: String, cwd: String, updatedAt: Double, phase: TaskPhase = .unknown, hasUnreadContent: Bool = false) {
-        self.id = id; self.title = title; self.cwd = cwd; self.updatedAt = updatedAt; self.phase = phase
+    public var statusNote: String?
+    public init(id: String, title: String, cwd: String, updatedAt: Double, phase: TaskPhase = .unknown, hasUnreadContent: Bool = false,
+                source: TaskSource = .local, statusNote: String? = nil) {
+        self.threadID = id; self.source = source; self.title = title; self.cwd = cwd; self.updatedAt = updatedAt; self.phase = phase
         self.hasUnreadContent = hasUnreadContent
+        self.statusNote = statusNote
     }
-    public var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
+    public var projectName: String { cwd.replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init) ?? "" }
     public var section: TaskSection {
         switch phase {
         case .waiting, .failed: return .attention
@@ -45,7 +91,10 @@ public struct IslandTask: Identifiable, Equatable {
         }
     }
     public var displayStatus: String {
-        hasUnreadContent && [.unknown, .idle].contains(phase) ? "有新内容 · 待查看" : phase.label
+        statusNote ?? (hasUnreadContent && [.unknown, .idle].contains(phase) ? "有新内容 · 待查看" : phase.label)
+    }
+    public mutating func invalidateStatus(_ note: String) {
+        phase = .unknown; hasUnreadContent = false; statusNote = note
     }
     public static func precedes(_ left: IslandTask, _ right: IslandTask) -> Bool {
         if left.section != right.section { return left.section.rawValue < right.section.rawValue }
@@ -166,6 +215,19 @@ public struct LiveTaskState {
 }
 
 public enum CodexLink {
+    public static func task(_ task: IslandTask) -> URL? {
+        switch task.source {
+        case .local, .remote:
+            // The desktop resolves the owning host from its catalog. Its thread deep link does not accept a host selector.
+            return thread(task.threadID)
+        case .codexCloud:
+            guard task.threadID.range(of: #"^task_[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else { return nil }
+            return URL(string: "https://chatgpt.com/codex/tasks/\(task.threadID)")
+        case .chatGPT:
+            guard UUID(uuidString: task.threadID) != nil else { return nil }
+            return URL(string: "https://chatgpt.com/c/\(task.threadID)")
+        }
+    }
     public static func thread(_ id: String) -> URL? {
         guard UUID(uuidString: id) != nil else { return nil }
         return URL(string: "codex://threads/\(id)")

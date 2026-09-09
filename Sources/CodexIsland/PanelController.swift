@@ -190,7 +190,7 @@ final class IslandPanel: NSPanel {
         let layout = model.layout
         let screen = chosenScreen().map(Self.geometry)
         return [
-            "appVersion": "0.1.22", "connected": model.connected, "liveTaskCount": model.liveCount,
+            "appVersion": "0.1.23", "connected": model.connected, "liveTaskCount": model.liveCount,
             "catalogCount": model.tasks.count, "runningCount": model.runningCount, "attentionCount": model.attentionCount,
             "priorityTaskCount": model.priorityTasks.count, "recentTaskCount": model.recentTasks.count,
             "usageRemaining": model.usageText,

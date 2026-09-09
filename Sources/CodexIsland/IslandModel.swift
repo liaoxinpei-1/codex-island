@@ -14,6 +14,7 @@ import IslandCore
     @Published var connected = false
     @Published var liveCount = 0
     @Published var catalogAvailable = true
+    @Published var sourceMessages: [String] = ["正在读取云端任务和机器名称…"]
     @Published var expanded = false
     @Published var pinned = false
     @Published var page = Page.tasks
@@ -50,6 +51,19 @@ import IslandCore
     var onFocusInput: (() -> Void)?
     var onStatusChange: (() -> Void)?
     private var observer: IPCObserver?
+    private var lastBridge = BridgeUpdate()
+    private var onlineReader: OnlineCatalogReader?
+    private var onlineTimer: Timer?
+    private var accountID: String?
+    private var hosts: [String: RemoteHost] = [:]
+    private var hasHostCatalog = false
+    private var hostFetchAt = Date.distantPast
+    private var cloudFetchAt = Date.distantPast
+    private var cloudTasks: [IslandTask] = []
+    private var cachedChats: [IslandTask] = []
+    private var cloudAvailable = false
+    private var hostsAvailable = false
+    private var onlineMessage: String? = "正在读取云端任务和机器名称…"
     private var usageReader: UsageReader?
     private var usageTimer: Timer?
     private var usageFeedbackReset: DispatchWorkItem?
@@ -66,7 +80,15 @@ import IslandCore
         observer?.start()
         let bundled = PetLibrary.codexApplication()?.appendingPathComponent("Contents/Resources/codex")
         let candidates = [bundled, URL(fileURLWithPath: "/opt/homebrew/bin/codex"), URL(fileURLWithPath: "/usr/local/bin/codex")].compactMap { $0 }
-        usageReader = UsageReader(executable: candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) })
+        let executable = candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        usageReader = UsageReader(executable: executable)
+        onlineReader = OnlineCatalogReader(executable: executable, home: home)
+        refreshOnlineCatalog()
+        let onlineTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshOnlineCatalog() }
+        }
+        self.onlineTimer = onlineTimer
+        RunLoop.main.add(onlineTimer, forMode: .common)
         refreshUsage()
         let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -77,7 +99,38 @@ import IslandCore
         usageTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
-    func stop() { observer?.stop(); usageTimer?.invalidate(); usageFeedbackReset?.cancel(); usageReader?.stop() }
+    func stop() {
+        observer?.stop(); usageTimer?.invalidate(); usageFeedbackReset?.cancel(); usageReader?.stop()
+        onlineTimer?.invalidate(); onlineReader?.stop()
+    }
+    private func refreshOnlineCatalog() {
+        onlineReader?.refresh { [weak self] result in
+            DispatchQueue.main.async { self?.applyOnlineCatalog(result) }
+        }
+    }
+    func applyOnlineCatalog(_ result: Result<OnlineCatalogUpdate, OnlineCatalogError>) {
+        switch result {
+        case .success(let update):
+            if accountID != update.accountID {
+                hosts = [:]; cloudTasks = []; cachedChats = []; hasHostCatalog = false
+                hostFetchAt = .distantPast; cloudFetchAt = .distantPast
+            }
+            accountID = update.accountID; onlineMessage = nil
+            hostsAvailable = update.hosts != nil; cloudAvailable = update.cloudTasks != nil
+            if let rows = update.hosts {
+                hosts = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+                hasHostCatalog = true; hostFetchAt = update.fetchedAt
+            }
+            if let rows = update.cloudTasks { cloudTasks = rows; cloudFetchAt = update.fetchedAt }
+            cachedChats = (try? DesktopTaskCatalog(codexHome: home, accountID: update.accountID).chatTasks(accountID: update.accountID)) ?? []
+        case .failure(let error):
+            onlineMessage = error.message; cloudAvailable = false; hostsAvailable = false
+            if case .authentication = error {
+                accountID = nil; cloudTasks = []; cachedChats = []; hosts = [:]; hasHostCatalog = false
+            }
+        }
+        rebuildTasks()
+    }
     var usageText: String { usageSnapshot?.label() ?? "—" }
     var usageHelp: String {
         guard let snapshot = usageSnapshot else { return usageMessage }
@@ -122,11 +175,44 @@ import IslandCore
         if visible { refreshUsage(force: true) }
         onStatusChange?()
     }
-    private func apply(_ update: BridgeUpdate) {
+    func apply(_ update: BridgeUpdate) {
+        lastBridge = update
+        rebuildTasks()
+    }
+    func rebuildTasks(now: Date = Date()) {
         let previousHeight = bodyHeight
-        if tasks != update.tasks { tasks = update.tasks }
-        connected = update.connected; liveCount = update.liveCount
-        connection = update.message; catalogAvailable = update.catalogAvailable
+        let cloudFresh = cloudAvailable && now.timeIntervalSince(cloudFetchAt) < 90
+        let hostsFresh = hostsAvailable && now.timeIntervalSince(hostFetchAt) < 90
+        var merged = lastBridge.tasks.compactMap { row -> IslandTask? in
+            var row = row
+            if case .remote(let id, let name) = row.source {
+                if id.hasPrefix("remote-control:"), hasHostCatalog, hosts[id] == nil { return nil }
+                if let host = hosts[id] {
+                    row.source = .remote(hostID: id, name: host.name)
+                    if hostsFresh && !host.online { row.invalidateStatus("主机离线 · 状态不可用") }
+                } else { row.source = .remote(hostID: id, name: name) }
+            }
+            return row
+        }
+        merged += cloudTasks.map {
+            var row = $0
+            if !cloudFresh { row.invalidateStatus("云端状态已过期") }
+            return row
+        }
+        merged += cachedChats
+        merged.sort(by: IslandTask.precedes)
+        if tasks != merged { tasks = merged }
+        connected = lastBridge.connected || cloudFresh
+        liveCount = lastBridge.liveCount
+        connection = lastBridge.message; catalogAvailable = lastBridge.catalogAvailable || cloudFresh || !cachedChats.isEmpty
+        var messages: [String] = []
+        if let onlineMessage { messages.append(onlineMessage) }
+        else {
+            if !hostsFresh { messages.append("机器名称暂不可用，已知名称仅供参考") }
+            if !cloudFresh { messages.append("Codex 云端状态暂不可用") }
+        }
+        if !cachedChats.isEmpty { messages.append("ChatGPT / Work 仅显示当前账户的缓存记录，无实时状态") }
+        if sourceMessages != messages { sourceMessages = messages }
         if expanded && page == .tasks && bodyHeight != previousHeight { onLayoutChange?() }
         onStatusChange?()
     }
@@ -232,7 +318,13 @@ import IslandCore
         if NSWorkspace.shared.open(url) { collapse() }
         else { feedback = "未能打开 Codex，请从菜单栏重试" }
     }
-    func openTask(_ task: IslandTask) { if let url = CodexLink.thread(task.id) { open(url) } }
+    func openTask(_ task: IslandTask) {
+        if task.source.hostID != nil,
+           Set(tasks.filter { $0.threadID == task.threadID }.compactMap { $0.source.hostID }).count > 1 {
+            feedback = "任务存在于多台机器，请在 Codex 中选择「\(task.source.label)」"
+            if let app = PetLibrary.codexApplication() { NSWorkspace.shared.open(app) }
+        } else if let url = CodexLink.task(task) { open(url) }
+    }
     func sendPrompt() {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }

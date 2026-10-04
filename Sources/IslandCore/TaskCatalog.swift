@@ -25,7 +25,10 @@ public struct TaskCatalog {
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int(statement, 1, Int32(limit))
         var result: [IslandTask] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return result }
+            guard status == SQLITE_ROW else { throw CatalogError.unavailable }
             func text(_ column: Int32) -> String {
                 sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""
             }
@@ -36,7 +39,6 @@ public struct TaskCatalog {
             result.append(IslandTask(id: id, title: title.isEmpty ? "未命名任务" : String(title.prefix(140)),
                                      cwd: text(2), updatedAt: sqlite3_column_double(statement, 3)))
         }
-        return result
     }
     enum CatalogError: Error { case unavailable, schema }
 }

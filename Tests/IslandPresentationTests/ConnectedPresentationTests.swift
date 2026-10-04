@@ -5,6 +5,50 @@ import IslandCore
 @testable import CodexIsland
 
 final class ConnectedPresentationTests: XCTestCase {
+    func testExecutableDiscoverySupportsCurrentAndLegacyClientLayouts() throws {
+        let application = FileManager.default.temporaryDirectory.appendingPathComponent("island-client-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: application) }
+        let legacy = application.appendingPathComponent("Contents/Resources/codex")
+        let current = application.appendingPathComponent("Contents/Resources/codex-cli/bin/codex")
+        try FileManager.default.createDirectory(at: current.deletingLastPathComponent(), withIntermediateDirectories: true)
+        func executable(_ url: URL) throws {
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+        }
+        try executable(legacy)
+        XCTAssertEqual(PetLibrary.codexExecutable(in: application), legacy)
+        try executable(current)
+        XCTAssertEqual(PetLibrary.codexExecutable(in: application), current)
+        try FileManager.default.removeItem(at: legacy)
+        XCTAssertEqual(PetLibrary.codexExecutable(in: application), current)
+    }
+
+    @MainActor func testMissingHostCatalogKeepsConfirmedActivityPendingWithoutExposingAnotherAccount() {
+        for phase in [TaskPhase.running, .waiting, .failed, .completed, .unknown] {
+            let model = IslandModel(home: FileManager.default.temporaryDirectory)
+            let host = RemoteHost(id: "remote-control:env", name: "Windows", online: true)
+            let remote = IslandTask(id: UUID().uuidString, title: "Remote", cwd: "", updatedAt: 1,
+                                    phase: phase, hasUnreadContent: phase == .unknown,
+                                    source: .remote(hostID: host.id, name: nil))
+            model.apply(BridgeUpdate(tasks: [remote], connected: true, liveCount: 1))
+            model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "a", hosts: nil, cloudTasks: [])))
+            XCTAssertTrue(model.tasks.isEmpty, "Keep account-scoped records hidden until their host is verified")
+            XCTAssertEqual(model.compactStatus, "待同步", "Missing host scope must not imply that confirmed work is idle")
+            XCTAssertEqual(model.priorityTasks.count, 0)
+
+            model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "a", hosts: [host], cloudTasks: [])))
+            XCTAssertEqual(model.tasks.first?.phase, phase)
+            XCTAssertEqual(model.compactStatus, "×1")
+            XCTAssertFalse(model.hasPendingCoverage)
+            model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "b", hosts: nil, cloudTasks: [])))
+            XCTAssertTrue(model.tasks.isEmpty)
+            XCTAssertEqual(model.compactStatus, "待同步")
+            model.applyOnlineCatalog(.success(OnlineCatalogUpdate(accountID: "b", hosts: [], cloudTasks: [])))
+            XCTAssertTrue(model.tasks.isEmpty)
+            XCTAssertEqual(model.compactStatus, "就绪", "A complete host list resolves the account-scope uncertainty")
+        }
+    }
+
     @MainActor func testActiveCacheWithoutSnapshotsDoesNotReportGlobalReady() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)

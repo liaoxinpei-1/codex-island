@@ -197,6 +197,35 @@ final class IslandCoreTests: XCTestCase {
         XCTAssertEqual(tasks.first?.title, "简短任务名")
         XCTAssertEqual(tasks.first?.phase, .unknown)
     }
+    func testCatalogThrowsWhenSteppingFailsInsteadOfReturningAnEmptyCatalog() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("island-tests-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("state_5.sqlite")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(file.path, &db), SQLITE_OK)
+        let sql = """
+        PRAGMA page_size=4096;
+        CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, updated_at INTEGER, archived INTEGER, source TEXT);
+        INSERT INTO threads VALUES ('\(UUID().uuidString)', NULL, 'Test', '/tmp/project', 100, 0, 'vscode');
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT rootpage FROM sqlite_master WHERE name = 'threads'", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let page = Int(sqlite3_column_int(statement, 0))
+        sqlite3_finalize(statement)
+        sqlite3_close(db)
+        XCTAssertEqual(try TaskCatalog(codexHome: folder).read().count, 1)
+
+        // Preserve the schema so prepare succeeds; only the table read fails with SQLITE_CORRUPT.
+        var data = try Data(contentsOf: file)
+        let offset = (page - 1) * 4096
+        XCTAssertGreaterThan(page, 1)
+        data[offset] = 0xFF
+        try data.write(to: file)
+        XCTAssertThrowsError(try TaskCatalog(codexHome: folder).read())
+    }
     func testPriorityOrderPlacesWaitingRunningAndUnreadAboveRecentTasks() {
         func task(_ id: String, _ phase: TaskPhase, _ time: Double, unread: Bool = false) -> IslandTask {
             IslandTask(id: id, title: id, cwd: "/project", updatedAt: time, phase: phase, hasUnreadContent: unread)

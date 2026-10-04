@@ -17,7 +17,15 @@ final class PetLibrary {
     static func codexApplication() -> URL? {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex")
         ?? ["/Applications/Codex.app", "/Applications/ChatGPT.app"].map { URL(fileURLWithPath: $0) }
-            .first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("Contents/Resources/codex").path) }
+            .first { app in bundledExecutables(in: app).contains { FileManager.default.isExecutableFile(atPath: $0.path) } }
+    }
+    static func codexExecutable(in application: URL? = codexApplication()) -> URL? {
+        let candidates = (application.map { bundledExecutables(in: $0) } ?? [])
+            + ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"].map { URL(fileURLWithPath: $0) }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+    private static func bundledExecutables(in application: URL) -> [URL] {
+        ["Contents/Resources/codex-cli/bin/codex", "Contents/Resources/codex"].map { application.appendingPathComponent($0) }
     }
     func reload() {
         var found: [PetDescriptor] = []

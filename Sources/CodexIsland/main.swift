@@ -18,7 +18,7 @@ if CommandLine.arguments.contains("--version") {
     var latest = BridgeUpdate()
     let online = OnlineDiagnosticResult()
     let includeOnline = CommandLine.arguments.contains("--diagnose-sources")
-    let onlineReader = OnlineCatalogReader(executable: PetLibrary.codexApplication()?.appendingPathComponent("Contents/Resources/codex"), home: home)
+    let onlineReader = OnlineCatalogReader(executable: PetLibrary.codexExecutable(), home: home)
     if includeOnline { onlineReader.refresh { result in online.set(result) } }
     let observer = IPCObserver(home: home) { update in lock.lock(); latest = update; lock.unlock() }
     observer.start()

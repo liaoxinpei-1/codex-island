@@ -225,28 +225,20 @@ final class IPCObserver {
             guard message["version"]?.int == Self.supportedSnapshotVersion else { throw ObserverError.incompatible }
             guard let change = params?["change"] else { return }
             if let snapshot = LiveTaskState(change: change) {
+                updateRecovery(for: id, accepting: snapshot)
                 snapshotDeadlines.removeValue(forKey: id)
                 live[id] = snapshot; owners[id] = message["sourceClientId"]?.string
                 if recovery[id]?.firstSnapshotDelay == nil, let requestedAt = recovery[id]?.requestedAt {
                     recovery[id]?.firstSnapshotDelay = Date().timeIntervalSince(requestedAt)
                 }
-                recovery[id]?.nextRetry = nil; recovery[id]?.reason = nil
-                if snapshot.phase == .unknown && !snapshot.hasUnreadContent {
-                    if recovery[id]?.activityHint != nil { recovery[id]?.reason = "state_unavailable" }
-                    if let record = recovery[id], record.activityHint != nil, record.retries < recoveryDelays.count {
-                        recovery[id]?.nextRetry = Date().addingTimeInterval(recoveryDelays[record.retries])
-                    }
-                } else { recovery[id]?.activityHint = nil }
                 recovery[id]?.gapRequested = false
             } else if change["type"]?.string == "patches" {
                 guard owners[id] == nil || owners[id] == message["sourceClientId"]?.string else { return }
                 if var state = live[id], state.apply(change: change) {
+                    updateRecovery(for: id, accepting: state)
                     // A continuous update also confirms this stream is alive during a heartbeat refresh.
                     snapshotDeadlines.removeValue(forKey: id)
                     live[id] = state
-                    if state.phase != .unknown || state.hasUnreadContent {
-                        recovery[id]?.nextRetry = nil; recovery[id]?.activityHint = nil; recovery[id]?.reason = nil
-                    }
                 }
                 else {
                     let needsSnapshot = recovery[id]?.gapRequested != true
@@ -258,6 +250,30 @@ final class IPCObserver {
                 }
             }
         default: break
+        }
+    }
+
+    private func updateRecovery(for id: String, accepting state: LiveTaskState) {
+        guard state.phase == .unknown && !state.hasUnreadContent else {
+            recovery[id]?.nextRetry = nil; recovery[id]?.activityHint = nil; recovery[id]?.reason = nil
+            return
+        }
+        // Preserve the last confirmed activity before replacing it with an unavailable runtime state.
+        if let previous = live[id], previous.phase != .unknown {
+            let hint: TaskActivityHint?
+            if [.running, .waiting, .failed].contains(previous.phase) { hint = .active }
+            else if previous.hasUnreadContent || previous.phase == .completed { hint = .unread }
+            else { hint = nil }
+            if let hint {
+                recovery[id]?.activityHint = hint
+                recovery[id]?.retries = 0; recovery[id]?.nextRetry = nil
+            }
+        }
+        guard let record = recovery[id], record.activityHint != nil else { return }
+        recovery[id]?.reason = record.retries < recoveryDelays.count ? "state_unavailable" : "retry_limit_reached"
+        // Repeated unavailable snapshots or patches must neither restart nor postpone recovery.
+        if record.nextRetry == nil && record.retries < recoveryDelays.count {
+            recovery[id]?.nextRetry = Date().addingTimeInterval(recoveryDelays[record.retries])
         }
     }
 

@@ -17,8 +17,16 @@ final class IPCObserverTests: XCTestCase {
         try exerciseObserver(heartbeatInterval: 2, snapshotTimeout: 1, checkRecovery: true)
     }
 
+    func testUnloadedSnapshotPreservesActivityAndRestartsBoundedRecovery() throws {
+        try exerciseObserver(heartbeatInterval: 2, snapshotTimeout: 1, unloadUsingPatches: false)
+    }
+
+    func testUnloadedPatchPreservesActivityAndRestartsBoundedRecovery() throws {
+        try exerciseObserver(heartbeatInterval: 2, snapshotTimeout: 1, unloadUsingPatches: true)
+    }
+
     private func exerciseObserver(heartbeatInterval: TimeInterval = 30, snapshotTimeout: TimeInterval = 10,
-                                  checkHeartbeat: Bool = false, checkRecovery: Bool = false) throws {
+                                  checkHeartbeat: Bool = false, checkRecovery: Bool = false, unloadUsingPatches: Bool? = nil) throws {
         // Two machines deliberately have the same thread UUID.
         let home = URL(fileURLWithPath: "/tmp/island-ipc-" + String(UUID().uuidString.prefix(8)))
         let ipc = home.appendingPathComponent("ipc")
@@ -47,7 +55,7 @@ final class IPCObserverTests: XCTestCase {
         let lock = NSLock()
         var latest = BridgeUpdate()
         let observer = IPCObserver(home: home, heartbeatInterval: heartbeatInterval, snapshotTimeout: snapshotTimeout,
-                                   recoveryDelays: checkRecovery ? [0.1, 0.2, 0.3] : [2, 5, 10]) { update in lock.lock(); latest = update; lock.unlock() }
+                                   recoveryDelays: (checkRecovery || unloadUsingPatches != nil) ? [0.1, 0.2, 0.3] : [2, 5, 10]) { update in lock.lock(); latest = update; lock.unlock() }
         observer.start()
         defer { observer.stop() }
         var descriptor = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
@@ -130,6 +138,41 @@ final class IPCObserverTests: XCTestCase {
             value.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .running &&
             value.tasks.first { $0.source.hostID == "ssh:two" }?.phase == .idle
         })
+        if let unloadUsingPatches {
+            var revision = 1
+            func unload() throws {
+                if unloadUsingPatches {
+                    try send(["type": "broadcast", "method": "thread-stream-state-changed", "version": 11, "sourceClientId": "ssh:one",
+                              "params": ["hostId": "ssh:one", "conversationId": id, "change": ["type": "patches", "baseRevision": revision,
+                              "revision": revision + 1, "patches": [["op": "replace", "path": ["threadRuntimeStatus", "type"], "value": "notLoaded"]]]]])
+                    revision += 1
+                } else { try snapshot(host: "ssh:one", status: "notLoaded") }
+            }
+            try unload()
+            guard eventually({ $0.coverage["ssh:one"]?.pending == 1 && $0.tasks.allSatisfy { $0.section == .recent } }) else {
+                return XCTFail("Losing confirmed runtime status must preserve pending activity without counting it as running")
+            }
+            for _ in 0..<3 {
+                let retry = try receive()
+                XCTAssertEqual(retry["params"]?["hostId"]?.string, "ssh:one")
+                try unload()
+            }
+            XCTAssertTrue(eventually { $0.coverage["ssh:one"]?.retries == 3 && $0.coverage["ssh:one"]?.pending == 1 })
+            // Repeated notLoaded replies must not restart the exhausted recovery loop.
+            for _ in 0..<2 {
+                let heartbeat = try receive()
+                XCTAssertEqual(heartbeat["params"]?["hostId"]?.string, "ssh:two")
+                try snapshot(host: "ssh:two", status: "idle")
+            }
+            try snapshot(host: "ssh:one", status: "active")
+            XCTAssertTrue(eventually { $0.tasks.first { $0.source.hostID == "ssh:one" }?.phase == .running && $0.coverage["ssh:one"]?.pending == 0 })
+            revision = 1
+            try unload()
+            let retry = try receive()
+            XCTAssertEqual(retry["params"]?["hostId"]?.string, "ssh:one", "A new loss gets a fresh recovery budget")
+            XCTAssertTrue(eventually { (1...3).contains($0.coverage["ssh:one"]?.retries ?? 0) && $0.coverage["ssh:one"]?.pending == 1 })
+            return
+        }
         if checkHeartbeat {
             let refresh = try [receive(), receive()]
             XCTAssertEqual(Set(refresh.compactMap { $0["params"]?["hostId"]?.string }), ["ssh:one", "ssh:two"])

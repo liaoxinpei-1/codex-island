@@ -79,9 +79,7 @@ import IslandCore
             DispatchQueue.main.async { self?.apply(update) }
         }
         observer?.start()
-        let bundled = PetLibrary.codexApplication()?.appendingPathComponent("Contents/Resources/codex")
-        let candidates = [bundled, URL(fileURLWithPath: "/opt/homebrew/bin/codex"), URL(fileURLWithPath: "/usr/local/bin/codex")].compactMap { $0 }
-        let executable = candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        let executable = PetLibrary.codexExecutable()
         usageReader = UsageReader(executable: executable)
         onlineReader = OnlineCatalogReader(executable: executable, home: home)
         refreshOnlineCatalog()
@@ -224,7 +222,9 @@ import IslandCore
     var pendingTasks: [IslandTask] { tasks.filter(\.hasPendingActivity) }
     var hasPendingCoverage: Bool {
         !pendingTasks.isEmpty || (accountID != nil && !hostsAvailable && lastBridge.tasks.contains {
-            $0.hasPendingActivity && $0.source.hostID?.hasPrefix("remote-control:") == true
+            guard let hostID = $0.source.hostID, hostID.hasPrefix("remote-control:"), hosts[hostID] == nil else { return false }
+            // Hidden account-scoped activity is still a coverage gap until the host list is known.
+            return $0.hasPendingActivity || $0.section != .recent
         })
     }
     var recentTasks: [IslandTask] { tasks.filter { $0.section == .recent && !$0.hasPendingActivity } }
